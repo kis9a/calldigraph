@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"flag"
 	"fmt"
 	"go/types"
 	"log/slog"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 
@@ -22,6 +24,7 @@ type config struct {
 	root       string
 	isDebug    bool
 	outputType string
+	excludes   []string
 }
 
 type command struct {
@@ -54,10 +57,43 @@ func main() {
 	}
 }
 
+type multiFlag []string
+
+func (m *multiFlag) String() string {
+	return strings.Join(*m, ",")
+}
+
+func (m *multiFlag) Set(value string) error {
+	if fi, err := os.Stat(value); err == nil && !fi.IsDir() {
+		f, err := os.Open(value)
+		if err != nil {
+			return fmt.Errorf("failed to open exclude file %q: %w", value, err)
+		}
+		defer f.Close()
+
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" {
+				continue
+			}
+			*m = append(*m, line)
+		}
+		if err := scanner.Err(); err != nil {
+			return fmt.Errorf("failed to read exclude file %q: %w", value, err)
+		}
+	} else {
+		*m = append(*m, value)
+	}
+	return nil
+}
+
 func parseFlags() (config, error) {
-	symbolFlag := flag.String("symbol", "", "The fully qualified symbol (function/method or type, e.g., github.com/xxx.(*Service).Method or github.com/xxx.TypeName)")
+	symbolFlag := flag.String("symbol", "", "Fully qualified symbol, e.g. github.com/xxx.(*Service).Method or github.com/xxx.TypeName")
 	debugFlag := flag.Bool("debug", false, "Enable debug logging")
-	typeFlag := flag.String("type", "all", "Output type: f for function calls, s for struct references, all for both (default)")
+	typeFlag := flag.String("type", "all", "Output type: f=func calls, s=struct references, all=both")
+	var excludePatterns multiFlag
+	flag.Var(&excludePatterns, "exclude", "Exclude symbol patterns (or file containing them). May be repeated.")
 
 	flag.Parse()
 
@@ -74,13 +110,14 @@ func parseFlags() (config, error) {
 		root:       moduleRoot,
 		isDebug:    *debugFlag,
 		outputType: *typeFlag,
+		excludes:   excludePatterns,
 	}, nil
 }
 
 func (a *command) Run(ctx context.Context) error {
 	absRoot, err := filepath.Abs(a.conf.root)
 	if err != nil {
-		return fmt.Errorf("failed to resolve module root path: %w", err)
+		return fmt.Errorf("failed to resolve module root: %w", err)
 	}
 	a.logger.Debug("Resolved module root", "absRoot", absRoot)
 
@@ -95,15 +132,35 @@ func (a *command) Run(ctx context.Context) error {
 
 	importPath, receiver, symbolName, err := parseSymbol(a.conf.symbol)
 	if err != nil {
-		return fmt.Errorf("failed to parse symbol flag: %w", err)
+		return fmt.Errorf("failed to parse symbol: %w", err)
 	}
 	a.logger.Debug("Parsed symbol", "importPath", importPath, "receiver", receiver, "symbolName", symbolName)
 
-	pkgs, err := loadPackagesRecursively(absRoot, importPath, a.logger)
-	if err != nil {
-		return fmt.Errorf("failed to load packages recursively: %w", err)
+	shouldSkipPackage := func(pkgPath string) bool {
+		for _, pattern := range a.conf.excludes {
+			matched, err := path.Match(pattern, pkgPath)
+			if err == nil && matched {
+				return true
+			}
+		}
+		return false
 	}
-	a.logger.Debug("Packages loaded (recursively)", "packageCount", len(pkgs))
+
+	shouldExcludeSymbol := func(fullName string) bool {
+		for _, pattern := range a.conf.excludes {
+			matched, err := path.Match(pattern, fullName)
+			if err == nil && matched {
+				return true
+			}
+		}
+		return false
+	}
+
+	pkgs, err := loadPackagesRecursively(absRoot, importPath, a.logger, shouldSkipPackage)
+	if err != nil {
+		return fmt.Errorf("loadPackagesRecursively: %w", err)
+	}
+	a.logger.Debug("Loaded packages", "count", len(pkgs))
 
 	prog, ssaPkgs := ssautil.AllPackages(pkgs, ssa.InstantiateGenerics)
 	prog.Build()
@@ -117,7 +174,6 @@ func (a *command) Run(ctx context.Context) error {
 	} else {
 		rootFunc = findMethodFunction(prog, ssaPkgs, importPath, receiver, symbolName)
 	}
-
 	if rootFunc == nil {
 		rootNamed = findNamedType(ssaPkgs, importPath, symbolName)
 		if rootNamed == nil {
@@ -126,82 +182,103 @@ func (a *command) Run(ctx context.Context) error {
 		isFuncRoot = false
 	}
 
+	implIndex := buildImplementerIndex(prog, modulePrefix, shouldSkipPackage, shouldExcludeSymbol)
+
 	if isFuncRoot {
-		a.logger.Debug("Found root function", "rootFunc", rootFunc.String())
+		a.logger.Debug("Found root function", "func", rootFunc.String())
+		cg, reachableFns := buildCallGraph(prog, rootFunc, modulePrefix, shouldSkipPackage, shouldExcludeSymbol, implIndex)
 
-		cg, reachableFuncs := buildCallGraph(prog, rootFunc, modulePrefix, a.logger)
+		structEdges := buildStructEdgesFromPackages(pkgs, shouldSkipPackage)
 
-		structEdgesMap := buildStructEdgesFromPackages(pkgs)
-
-		funcToTypeEdges := make([][2]string, 0)
+		funcToTypeEdges := [][2]string{}
 		reachableTypes := make(map[*types.Named]bool)
 
-		for fn := range reachableFuncs {
+		for fn := range reachableFns {
+			if shouldExcludeSymbol(fn.String()) {
+				continue
+			}
 			usedTypes := collectFunctionUsedTypes(fn)
 			for _, nt := range usedTypes {
+				if nt == nil {
+					continue
+				}
+				if shouldSkipPackage(namedTypePackagePath(nt)) {
+					continue
+				}
+				if shouldExcludeSymbol(namedTypeString(nt)) {
+					continue
+				}
 				if !strings.HasPrefix(namedTypePackagePath(nt), modulePrefix) {
 					continue
 				}
-				funcToTypeEdges = append(funcToTypeEdges, [2]string{
-					fn.String(),
-					namedTypeString(nt),
-				})
+				funcToTypeEdges = append(funcToTypeEdges, [2]string{fn.String(), namedTypeString(nt)})
 				reachableTypes[nt] = true
 			}
 		}
 
-		typeEdges := make([][2]string, 0)
 		visitedType := make(map[*types.Named]bool)
+		typeEdges := [][2]string{}
 
-		var walkTypes func(t *types.Named)
+		var walkTypes func(*types.Named)
 		walkTypes = func(t *types.Named) {
 			if visitedType[t] {
 				return
 			}
 			visitedType[t] = true
 
-			for _, child := range structEdgesMap[t] {
+			children := structEdges[t]
+			for _, child := range children {
+				if shouldSkipPackage(namedTypePackagePath(child)) {
+					continue
+				}
+				if shouldExcludeSymbol(namedTypeString(child)) {
+					continue
+				}
 				if !strings.HasPrefix(namedTypePackagePath(child), modulePrefix) {
 					continue
 				}
-				typeEdges = append(typeEdges, [2]string{
-					namedTypeString(t),
-					namedTypeString(child),
-				})
+				typeEdges = append(typeEdges, [2]string{namedTypeString(t), namedTypeString(child)})
 				if !visitedType[child] {
 					reachableTypes[child] = true
 					walkTypes(child)
 				}
 			}
 		}
-
 		for t := range reachableTypes {
 			walkTypes(t)
 		}
 
 		var funcEdges [][2]string
 		for fn, node := range cg.Nodes {
-			if fn == nil || fn.Pkg == nil {
+			if fn == nil || fn.Pkg == nil || node == nil {
 				continue
 			}
-			if !strings.HasPrefix(fn.Package().Pkg.Path(), modulePrefix) {
+			pkgPath := fn.Package().Pkg.Path()
+			if shouldSkipPackage(pkgPath) {
 				continue
 			}
-			if node == nil {
+			if shouldExcludeSymbol(fn.String()) {
 				continue
 			}
-			for _, edge := range node.Out {
-				calleeFn := edge.Callee.Func
-				if calleeFn == nil || calleeFn.Pkg == nil {
+			if !strings.HasPrefix(pkgPath, modulePrefix) {
+				continue
+			}
+			for _, out := range node.Out {
+				callee := out.Callee.Func
+				if callee == nil || callee.Pkg == nil {
 					continue
 				}
-				if !strings.HasPrefix(calleeFn.Package().Pkg.Path(), modulePrefix) {
+				calleePath := callee.Pkg.Pkg.Path()
+				if shouldSkipPackage(calleePath) {
 					continue
 				}
-				funcEdges = append(funcEdges, [2]string{
-					fn.String(),
-					calleeFn.String(),
-				})
+				if shouldExcludeSymbol(callee.String()) {
+					continue
+				}
+				if !strings.HasPrefix(calleePath, modulePrefix) {
+					continue
+				}
+				funcEdges = append(funcEdges, [2]string{fn.String(), callee.String()})
 			}
 		}
 
@@ -210,7 +287,6 @@ func (a *command) Run(ctx context.Context) error {
 			for _, e := range funcEdges {
 				fmt.Printf("%q -> %q\n", e[0], e[1])
 			}
-
 		case "s":
 			for _, e := range funcToTypeEdges {
 				fmt.Printf("%q -> %q\n", e[0], e[1])
@@ -218,7 +294,6 @@ func (a *command) Run(ctx context.Context) error {
 			for _, e := range typeEdges {
 				fmt.Printf("%q -> %q\n", e[0], e[1])
 			}
-
 		default:
 			for _, e := range funcEdges {
 				fmt.Printf("%q -> %q\n", e[0], e[1])
@@ -229,22 +304,26 @@ func (a *command) Run(ctx context.Context) error {
 			for _, e := range typeEdges {
 				fmt.Printf("%q -> %q\n", e[0], e[1])
 			}
+
 		}
 	} else {
-		a.logger.Debug("Found root type", "rootType", namedTypeString(rootNamed))
-		structEdgesMap := buildStructEdgesFromPackages(pkgs)
-		typeEdges := make([][2]string, 0)
-		visitedType := make(map[*types.Named]bool)
+		a.logger.Debug("Found root type", "type", namedTypeString(rootNamed))
 
-		var walkTypes func(t *types.Named)
+		structEdges := buildStructEdgesFromPackages(pkgs, shouldSkipPackage)
+		visitedType := make(map[*types.Named]bool)
+		typeEdges := [][2]string{}
+
+		var walkTypes func(*types.Named)
 		walkTypes = func(t *types.Named) {
 			if visitedType[t] {
 				return
 			}
 			visitedType[t] = true
-
-			for _, child := range structEdgesMap[t] {
-				if !strings.HasPrefix(namedTypePackagePath(child), modulePrefix) {
+			for _, child := range structEdges[t] {
+				if shouldSkipPackage(namedTypePackagePath(child)) {
+					continue
+				}
+				if shouldExcludeSymbol(namedTypeString(child)) {
 					continue
 				}
 				typeEdges = append(typeEdges, [2]string{
@@ -254,7 +333,11 @@ func (a *command) Run(ctx context.Context) error {
 				walkTypes(child)
 			}
 		}
-		walkTypes(rootNamed)
+
+		if !shouldSkipPackage(namedTypePackagePath(rootNamed)) &&
+			!shouldExcludeSymbol(namedTypeString(rootNamed)) {
+			walkTypes(rootNamed)
+		}
 
 		switch a.conf.outputType {
 		case "s", "all":
@@ -267,93 +350,6 @@ func (a *command) Run(ctx context.Context) error {
 	}
 
 	return nil
-}
-
-func loadPackagesRecursively(dir, initialPattern string, logger *slog.Logger) ([]*packages.Package, error) {
-	conf := &packages.Config{
-		Mode: packages.NeedName |
-			packages.NeedTypes |
-			packages.NeedTypesInfo |
-			packages.NeedImports |
-			packages.NeedDeps |
-			packages.NeedSyntax |
-			packages.NeedCompiledGoFiles,
-		Dir:   dir,
-		Tests: false,
-	}
-
-	loadedMap := make(map[string]*packages.Package)
-
-	var addPkg func(pkg *packages.Package)
-	addPkg = func(pkg *packages.Package) {
-		if pkg == nil || pkg.PkgPath == "" {
-			return
-		}
-		if _, exists := loadedMap[pkg.PkgPath]; exists {
-			return
-		}
-		loadedMap[pkg.PkgPath] = pkg
-		for _, imp := range pkg.Imports {
-			addPkg(imp)
-		}
-	}
-
-	initialPkgs, err := packages.Load(conf, initialPattern)
-	if err != nil {
-		return nil, fmt.Errorf("packages.Load error: %w", err)
-	}
-	if packages.PrintErrors(initialPkgs) > 0 {
-		return nil, fmt.Errorf("errors encountered during initial package loading")
-	}
-	for _, pkg := range initialPkgs {
-		addPkg(pkg)
-	}
-
-	for {
-		allPkgs := make([]*packages.Package, 0, len(loadedMap))
-		for _, pkg := range loadedMap {
-			allPkgs = append(allPkgs, pkg)
-		}
-		prog, _ := ssautil.AllPackages(allPkgs, ssa.InstantiateGenerics)
-		prog.Build()
-
-		missingSet := make(map[string]struct{})
-		for _, ssaPkg := range prog.AllPackages() {
-			if ssaPkg.Pkg == nil {
-				continue
-			}
-			pkgPath := ssaPkg.Pkg.Path()
-			if _, ok := loadedMap[pkgPath]; !ok {
-				missingSet[pkgPath] = struct{}{}
-			}
-		}
-
-		if len(missingSet) == 0 {
-			break
-		}
-
-		missingSlice := make([]string, 0, len(missingSet))
-		for pkgPath := range missingSet {
-			missingSlice = append(missingSlice, pkgPath)
-		}
-		logger.Debug("Loading missing packages", "packages", missingSlice)
-		newPkgs, err := packages.Load(conf, missingSlice...)
-		if err != nil {
-			return nil, fmt.Errorf("packages.Load error (missing packages): %w", err)
-		}
-		if packages.PrintErrors(newPkgs) > 0 {
-			return nil, fmt.Errorf("errors encountered during missing package loading")
-		}
-		for _, pkg := range newPkgs {
-			addPkg(pkg)
-		}
-	}
-
-	result := make([]*packages.Package, 0, len(loadedMap))
-	for _, pkg := range loadedMap {
-		result = append(result, pkg)
-	}
-	return result, nil
 }
 
 func detectModulePrefix(dir string, logger *slog.Logger) (string, error) {
@@ -376,7 +372,7 @@ func detectModulePrefix(dir string, logger *slog.Logger) (string, error) {
 func parseSymbol(symbol string) (importPath, receiver, symbolName string, err error) {
 	lastDot := strings.LastIndex(symbol, ".")
 	if lastDot == -1 || lastDot == len(symbol)-1 {
-		return "", "", "", fmt.Errorf("invalid format: missing '.' in symbol (%q)", symbol)
+		return "", "", "", fmt.Errorf("invalid symbol format: %q", symbol)
 	}
 	importPathPart := symbol[:lastDot]
 	symbolName = symbol[lastDot+1:]
@@ -384,7 +380,7 @@ func parseSymbol(symbol string) (importPath, receiver, symbolName string, err er
 	if receiverStart != -1 && strings.Contains(importPathPart[receiverStart:], ")") {
 		receiverEnd := strings.Index(importPathPart[receiverStart:], ")")
 		if receiverEnd == -1 {
-			return "", "", "", fmt.Errorf("closing ')' not found for receiver in %q", importPathPart)
+			return "", "", "", fmt.Errorf("closing ')' not found in %q", importPathPart)
 		}
 		receiverEnd += receiverStart
 		receiver = importPathPart[receiverStart+1 : receiverEnd]
@@ -399,8 +395,105 @@ func parseSymbol(symbol string) (importPath, receiver, symbolName string, err er
 	return importPath, receiver, symbolName, nil
 }
 
-func findFunction(pkgs []*ssa.Package, importPath, function string) *ssa.Function {
-	for _, pkg := range pkgs {
+func loadPackagesRecursively(
+	dir, initialPattern string,
+	logger *slog.Logger,
+	skipPackage func(string) bool,
+) ([]*packages.Package, error) {
+
+	conf := &packages.Config{
+		Mode: packages.NeedName |
+			packages.NeedTypes |
+			packages.NeedTypesInfo |
+			packages.NeedImports |
+			packages.NeedDeps |
+			packages.NeedSyntax |
+			packages.NeedCompiledGoFiles,
+		Dir:   dir,
+		Tests: false,
+	}
+	loadedMap := make(map[string]*packages.Package)
+
+	var addPkg func(pkg *packages.Package)
+	addPkg = func(pkg *packages.Package) {
+		if pkg == nil || pkg.PkgPath == "" {
+			return
+		}
+		if skipPackage(pkg.PkgPath) {
+			logger.Debug("Skipping package", "pkgPath", pkg.PkgPath)
+			return
+		}
+		if _, ok := loadedMap[pkg.PkgPath]; ok {
+			return
+		}
+		loadedMap[pkg.PkgPath] = pkg
+		for _, imp := range pkg.Imports {
+			addPkg(imp)
+		}
+	}
+
+	initialPkgs, err := packages.Load(conf, initialPattern)
+	if err != nil {
+		return nil, fmt.Errorf("packages.Load error: %w", err)
+	}
+	if packages.PrintErrors(initialPkgs) > 0 {
+		return nil, fmt.Errorf("errors encountered in initial package loading")
+	}
+
+	for _, pkg := range initialPkgs {
+		addPkg(pkg)
+	}
+
+	for {
+		allPkgs := make([]*packages.Package, 0, len(loadedMap))
+		for _, p := range loadedMap {
+			allPkgs = append(allPkgs, p)
+		}
+		prog, _ := ssautil.AllPackages(allPkgs, ssa.InstantiateGenerics)
+		prog.Build()
+
+		missing := make(map[string]struct{})
+		for _, ssaPkg := range prog.AllPackages() {
+			if ssaPkg.Pkg == nil {
+				continue
+			}
+			if skipPackage(ssaPkg.Pkg.Path()) {
+				continue
+			}
+			if _, ok := loadedMap[ssaPkg.Pkg.Path()]; !ok {
+				missing[ssaPkg.Pkg.Path()] = struct{}{}
+			}
+		}
+		if len(missing) == 0 {
+			break
+		}
+		missingSlice := make([]string, 0, len(missing))
+		for pkgPath := range missing {
+			missingSlice = append(missingSlice, pkgPath)
+		}
+		logger.Debug("Loading missing packages", "count", len(missingSlice), "packages", missingSlice)
+
+		newPkgs, err := packages.Load(conf, missingSlice...)
+		if err != nil {
+			return nil, fmt.Errorf("packages.Load missing error: %w", err)
+		}
+		if packages.PrintErrors(newPkgs) > 0 {
+			return nil, fmt.Errorf("errors encountered in missing package loading")
+		}
+		for _, p := range newPkgs {
+			addPkg(p)
+		}
+	}
+
+	result := make([]*packages.Package, 0, len(loadedMap))
+	for _, p := range loadedMap {
+		result = append(result, p)
+	}
+	return result, nil
+}
+
+func findFunction(ssaPkgs []*ssa.Package, importPath, function string) *ssa.Function {
+	for _, pkg := range ssaPkgs {
 		if pkg.Pkg.Path() == importPath {
 			if fn := pkg.Func(function); fn != nil {
 				return fn
@@ -412,10 +505,10 @@ func findFunction(pkgs []*ssa.Package, importPath, function string) *ssa.Functio
 
 func findMethodFunction(
 	prog *ssa.Program,
-	pkgs []*ssa.Package,
+	ssapkgs []*ssa.Package,
 	importPath, receiver, function string,
 ) *ssa.Function {
-	for _, pkg := range pkgs {
+	for _, pkg := range ssapkgs {
 		if pkg.Pkg.Path() != importPath {
 			continue
 		}
@@ -460,11 +553,90 @@ func findNamedType(ssaPkgs []*ssa.Package, importPath, typeName string) *types.N
 	return nil
 }
 
+type implementerIndex struct {
+	Type  types.Type
+	Funcs map[string]*ssa.Function
+}
+
+func buildImplementerIndex(
+	prog *ssa.Program,
+	modulePrefix string,
+	skipPkg func(string) bool,
+	skipSym func(string) bool,
+) []implementerIndex {
+
+	var index []implementerIndex
+
+	for _, ssaPkg := range prog.AllPackages() {
+		if ssaPkg.Pkg == nil {
+			continue
+		}
+		pkgPath := ssaPkg.Pkg.Path()
+		if !strings.HasPrefix(pkgPath, modulePrefix) {
+			continue
+		}
+		if skipPkg(pkgPath) {
+			continue
+		}
+		for _, mem := range ssaPkg.Members {
+			t, ok := mem.(*ssa.Type)
+			if !ok {
+				continue
+			}
+			if _, isIface := t.Type().Underlying().(*types.Interface); isIface {
+				continue
+			}
+			fullTypeName := pkgPath + "." + t.Name()
+			if skipSym(fullTypeName) {
+				continue
+			}
+
+			msVal := make(map[string]*ssa.Function)
+			var TT types.Type = t.Type()
+
+			ms := prog.MethodSets.MethodSet(TT)
+			for i := 0; i < ms.Len(); i++ {
+				sel := ms.At(i)
+				mName := sel.Obj().Name()
+				fn := prog.MethodValue(sel)
+				if fn != nil {
+					if !skipSym(fn.String()) {
+						msVal[mName] = fn
+					}
+				}
+			}
+
+			ptrT := types.NewPointer(TT)
+			msPtr := prog.MethodSets.MethodSet(ptrT)
+			for i := 0; i < msPtr.Len(); i++ {
+				sel := msPtr.At(i)
+				mName := sel.Obj().Name()
+				fn := prog.MethodValue(sel)
+				if fn != nil {
+					if !skipSym(fn.String()) {
+						msVal[mName] = fn
+					}
+				}
+			}
+
+			if len(msVal) > 0 {
+				index = append(index, implementerIndex{
+					Type:  TT,
+					Funcs: msVal,
+				})
+			}
+		}
+	}
+	return index
+}
+
 func buildCallGraph(
 	prog *ssa.Program,
 	root *ssa.Function,
 	modulePrefix string,
-	logger *slog.Logger,
+	skipPkg func(string) bool,
+	skipSym func(string) bool,
+	implIndex []implementerIndex,
 ) (*callgraph.Graph, map[*ssa.Function]bool) {
 
 	cg := callgraph.New(root)
@@ -475,10 +647,17 @@ func buildCallGraph(
 		if fn == nil || fn.Pkg == nil {
 			return
 		}
-		if !strings.HasPrefix(fn.Package().Pkg.Path(), modulePrefix) {
+		if visited[fn] {
 			return
 		}
-		if visited[fn] {
+		pkgPath := fn.Package().Pkg.Path()
+		if skipPkg(pkgPath) {
+			return
+		}
+		if !strings.HasPrefix(pkgPath, modulePrefix) {
+			return
+		}
+		if skipSym(fn.String()) {
 			return
 		}
 		visited[fn] = true
@@ -492,52 +671,41 @@ func buildCallGraph(
 				callCommon := callInstr.Common()
 				callee := callCommon.StaticCallee()
 				if callee != nil {
-					from := cg.CreateNode(fn)
-					to := cg.CreateNode(callee)
-					callgraph.AddEdge(from, callInstr, to)
-					dfs(callee)
+					if !skipSym(callee.String()) {
+						from := cg.CreateNode(fn)
+						to := cg.CreateNode(callee)
+						callgraph.AddEdge(from, callInstr, to)
+						dfs(callee)
+					}
 					continue
 				}
 				if callCommon.Value != nil {
 					t := callCommon.Value.Type()
-					if t != nil {
-						iface, ok := t.Underlying().(*types.Interface)
-						if ok {
-							mname := callCommon.Method.Name()
-							for _, pkg := range prog.AllPackages() {
-								if pkg.Pkg == nil {
-									continue
-								}
-								if !strings.HasPrefix(pkg.Pkg.Path(), modulePrefix) {
-									continue
-								}
-								for _, mem := range pkg.Members {
-									ssaType, ok := mem.(*ssa.Type)
-									if !ok {
-										continue
-									}
-									if _, isIface := ssaType.Type().Underlying().(*types.Interface); isIface {
-										continue
-									}
-									concrete := ssaType.Type()
-									if !types.Implements(concrete, iface) &&
-										!types.Implements(types.NewPointer(concrete), iface) {
-										continue
-									}
-									m := lookupMethodSafe(prog, concrete, mname)
-									if m == nil {
-										m = lookupMethodSafe(prog, types.NewPointer(concrete), mname)
-									}
-									if m == nil {
-										continue
-									}
-									from := cg.CreateNode(fn)
-									to := cg.CreateNode(m)
-									callgraph.AddEdge(from, callInstr, to)
-									dfs(m)
-								}
-							}
+					if t == nil {
+						continue
+					}
+					iface, ok := t.Underlying().(*types.Interface)
+					if !ok {
+						continue
+					}
+					mName := callCommon.Method.Name()
+
+					for _, idx := range implIndex {
+						if !types.Implements(idx.Type, iface) &&
+							!types.Implements(types.NewPointer(idx.Type), iface) {
+							continue
 						}
+						cfn := idx.Funcs[mName]
+						if cfn == nil {
+							continue
+						}
+						if skipSym(cfn.String()) {
+							continue
+						}
+						from := cg.CreateNode(fn)
+						to := cg.CreateNode(cfn)
+						callgraph.AddEdge(from, callInstr, to)
+						dfs(cfn)
 					}
 				}
 			}
@@ -548,18 +716,11 @@ func buildCallGraph(
 	return cg, visited
 }
 
-func lookupMethodSafe(prog *ssa.Program, T types.Type, mname string) *ssa.Function {
-	ms := prog.MethodSets.MethodSet(T)
-	for i := 0; i < ms.Len(); i++ {
-		sel := ms.At(i)
-		if sel.Obj().Name() == mname {
-			return prog.MethodValue(sel)
-		}
-	}
-	return nil
-}
+func buildStructEdgesFromPackages(
+	pkgs []*packages.Package,
+	skipPackage func(string) bool,
+) map[*types.Named][]*types.Named {
 
-func buildStructEdgesFromPackages(pkgs []*packages.Package) map[*types.Named][]*types.Named {
 	edges := make(map[*types.Named][]*types.Named)
 	visited := make(map[*types.Named]bool)
 
@@ -576,10 +737,10 @@ func buildStructEdgesFromPackages(pkgs []*packages.Package) map[*types.Named][]*
 		}
 		for i := 0; i < st.NumFields(); i++ {
 			ft := st.Field(i).Type()
-			named := extractNamed(ft)
-			if named != nil {
-				edges[n] = append(edges[n], named)
-				collectFields(named)
+			child := extractNamed(ft)
+			if child != nil {
+				edges[n] = append(edges[n], child)
+				collectFields(child)
 			}
 		}
 	}
@@ -588,6 +749,10 @@ func buildStructEdgesFromPackages(pkgs []*packages.Package) map[*types.Named][]*
 		if pkg.Types == nil || pkg.Types.Scope() == nil {
 			continue
 		}
+		if skipPackage(pkg.PkgPath) {
+			continue
+		}
+
 		scope := pkg.Types.Scope()
 		for _, name := range scope.Names() {
 			obj := scope.Lookup(name)
@@ -612,13 +777,13 @@ func buildStructEdgesFromPackages(pkgs []*packages.Package) map[*types.Named][]*
 func collectFunctionUsedTypes(fn *ssa.Function) []*types.Named {
 	found := make(map[*types.Named]bool)
 
-	var collect func(t types.Type)
-	collect = func(t types.Type) {
-		named := extractNamed(t)
+	var collect func(types.Type)
+	collect = func(tt types.Type) {
+		named := extractNamed(tt)
 		if named != nil {
 			found[named] = true
 		}
-		switch u := t.Underlying().(type) {
+		switch u := tt.Underlying().(type) {
 		case *types.Pointer:
 			collect(u.Elem())
 		case *types.Slice:
@@ -641,12 +806,11 @@ func collectFunctionUsedTypes(fn *ssa.Function) []*types.Named {
 	}
 
 	if fn.Signature != nil {
-		sig := fn.Signature
-		for i := 0; i < sig.Params().Len(); i++ {
-			collect(sig.Params().At(i).Type())
+		for i := 0; i < fn.Signature.Params().Len(); i++ {
+			collect(fn.Signature.Params().At(i).Type())
 		}
-		for i := 0; i < sig.Results().Len(); i++ {
-			collect(sig.Results().At(i).Type())
+		for i := 0; i < fn.Signature.Results().Len(); i++ {
+			collect(fn.Signature.Results().At(i).Type())
 		}
 	}
 
@@ -655,21 +819,19 @@ func collectFunctionUsedTypes(fn *ssa.Function) []*types.Named {
 			if val, ok := instr.(ssa.Value); ok {
 				collect(val.Type())
 			}
-
 			var ops []*ssa.Value
 			ops = instr.Operands(ops)
 			for _, op := range ops {
 				if op == nil {
 					continue
 				}
-				val := *op
-				if val == nil {
-					continue
+				if *op != nil {
+					collect((*op).Type())
 				}
-				collect(val.Type())
 			}
 		}
 	}
+
 	result := make([]*types.Named, 0, len(found))
 	for nt := range found {
 		result = append(result, nt)

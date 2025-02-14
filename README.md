@@ -51,3 +51,13 @@ $ callgrapher -symbol 'github.com/example/api/usecase.(*BookingUsecaseImpl).GetP
 (*github.com/example/api/repository.BookingImpl).GetBookingsBetween
 ...
 ```
+
+```
+$ cat ./tmp/.exclude
+github.com/example/api/dto
+
+$ callgrapher -symbol 'github.com/example/api/usecase.(*BookingUsecaseImpl).GetPeriodic' . \
+  | -exclude ./tmp/.exclude \
+  | -exclude 'github.com/example/api/repository.*'
+...
+```
