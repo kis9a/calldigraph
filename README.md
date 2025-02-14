@@ -24,7 +24,7 @@ go install golang.org/x/tools/cmd/digraph@latest
 ## Example
 
 ```
-$ callgrapher -type f -symbol 'github.com/example/api/usecase.(*BookingUsecaseImpl).GetPeriodic' .
+$ calldigraph -type f -symbol 'github.com/example/api/usecase.(*BookingUsecaseImpl).GetPeriodic' .
 "(*github.com/example/api/usecase.BookingUsecaseImpl).GetPeriodic" -> "(*github.com/example/api/repository.BookingImpl).GetBookingsBetween"
 "(*github.com/example/api/repository.BookingImpl).GetBookingsBetween" -> "(*github.com/example/api/dto.Booking).GetBookingsBetween"
 "(*github.com/example/api/usecase.BookingUsecaseImpl).GetPeriodic" -> "(*github.com/example/api/repository.BookingScheduleImpl).FetchByBookingIDs"
@@ -33,7 +33,7 @@ $ callgrapher -type f -symbol 'github.com/example/api/usecase.(*BookingUsecaseIm
 ```
 
 ```
-$ callgrapher -type f -symbol 'github.com/example/api/usecase.(*BookingUsecaseImpl).GetPeriodic' . \
+$ calldigraph -type f -symbol 'github.com/example/api/usecase.(*BookingUsecaseImpl).GetPeriodic' . \
   | digraph nodes
 
 (*github.com/example/api/usecase.BookingUsecaseImpl).GetPeriodic
@@ -45,7 +45,7 @@ $ callgrapher -type f -symbol 'github.com/example/api/usecase.(*BookingUsecaseIm
 ```
 
 ```
-$ callgrapher -symbol 'github.com/example/api/usecase.(*BookingUsecaseImpl).GetPeriodic' . \
+$ calldigraph -symbol 'github.com/example/api/usecase.(*BookingUsecaseImpl).GetPeriodic' . \
   | digraph preds "(*github.com/example/api/dto.Booking).GetBookingsBetween"
 
 (*github.com/example/api/repository.BookingImpl).GetBookingsBetween
@@ -56,7 +56,7 @@ $ callgrapher -symbol 'github.com/example/api/usecase.(*BookingUsecaseImpl).GetP
 $ cat ./tmp/.exclude
 github.com/example/api/dto
 
-$ callgrapher -symbol 'github.com/example/api/usecase.(*BookingUsecaseImpl).GetPeriodic' . \
+$ calldigraph -symbol 'github.com/example/api/usecase.(*BookingUsecaseImpl).GetPeriodic' . \
   | -exclude ./tmp/.exclude \
   | -exclude 'github.com/example/api/repository.*'
 ...
